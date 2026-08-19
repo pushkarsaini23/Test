@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>PO Gap Analyzer — eGBS Edition</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#0f1117;font-family:'JetBrains Mono','Courier New',monospace;}
+::-webkit-scrollbar{width:6px;height:6px;}
+::-webkit-scrollbar-track{background:#1a1d2e;}
+::-webkit-scrollbar-thumb{background:#2a3560;border-radius:3px;}
+select{background:#1a1d2e;border:1px solid #2a3560;color:#e8e8e8;padding:5px 8px;border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer;outline:none;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useCallback,useMemo}=React;
+const MON_LABELS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+// ═══════════════════════════════════════════════════════
+// DYNAMIC MONTH RANGE
+// Start: Jan of (currentYear-1)  End: current month
+// 2026 → Jan-25 … Aug-26   |   2027 → Jan-26 … current-27
+// ═══════════════════════════════════════════════════════
+function buildMonthRange(){
+  const now=new Date();
+  const cy=now.getFullYear(), cm=now.getMonth()+1;
+  const sy=cy-1;
+  const months=[];
+  let y=sy,m=1;
+  while(y<cy||(y===cy&&m<=cm)){
+    months.push(`${MON_LABELS[m-1]}-${String(y).slice(2)}`);
+    m++;if(m>12){m=1;y++;}
+  }
+  return months;
+}
+const ALL_MONTHS      = buildMonthRange();
+const CURRENT_MONTH   = (()=>{const n=new Date();return `${MON_LABELS[n.getMonth()]}-${String(n.getFullYear()).slice(2)}`;})();
+const CUR_IDX         = ALL_MONTHS.indexOf(CURRENT_MONTH);
+
+// Only FLAG gaps from Jul of start-year onwards (point 3)
+const FLAG_START_LABEL= `Jul-${String(new Date().getFullYear()-1).slice(2)}`;
+const FLAG_FROM_IDX   = Math.max(0, ALL_MONTHS.indexOf(FLAG_START_LABEL));
+
+// ═══════════════════════════════════════════════════════
+// PARSERS
+// ═══════════════════════════════════════════════════════
+const MON_LC=["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
+function parseActivityPeriod(val){
+  if(val==null||val==="")return null;
+  if(typeof val==="number"&&val>10000){
+    const d=XLSX.SSF.parse_date_code(val);
+    if(!d)return null;
+    const mo=MON_LC[d.m-1];if(!mo)return null;
+    return `${mo[0].toUpperCase()+mo.slice(1)}-${String(d.y).slice(2)}`;
+  }
+  const s=String(val).trim();
+  let m=s.match(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/](\d{2,4})$/i);
+  if(m){let yr=m[2];if(yr.length===4)yr=yr.slice(2);return `${m[1][0].toUpperCase()+m[1].slice(1).toLowerCase()}-${yr}`;}
+  m=s.match(/^(\d{1,2})[\/\-](\d{4})$/)||s.match(/^(\d{4})[\/\-](\d{2})$/);
+  if(m){
+    let mn=parseInt(m[1]),yr=m[2];
+    if(mn>12){mn=parseInt(m[2]);yr=m[1];}
+    if(mn<1||mn>12)return null;
+    return `${MON_LABELS[mn-1]}-${String(yr).slice(-2)}`;
+  }
+  return null;
+}
+function parseAmt(v){
+  if(v==null||v==="")return 0;
+  if(typeof v==="number")return v;
+  return parseFloat(String(v).replace(/[,$()]/g,""))||0;
+}
+
+// ═══════════════════════════════════════════════════════
+// AUTO-DETECT COLUMNS
+// ═══════════════════════════════════════════════════════
+function autoDetectCols(headers){
+  const h=headers.map(x=>String(x??"").toLowerCase().trim());
+  const find=(...kws)=>{for(const kw of kws){const i=h.findIndex(x=>x.includes(kw));if(i>=0)return headers[i];}return null;};
+  return{
+    eGBSCol:           find("parent egbs","parent_egbs","parentegbs","egbs parent","egbs"),
+    poCol:             find("purchase order no","purchase order","po number","po no","po#"),
+    activityPeriodCol: find("activity period","actperiod","period","activity_period"),
+    amtCol:            find("amt","amount","sum of amt","total amt"),
+    invDtCol:          find("inv dt","invoice dt","invoice date","inv date","invdt"),
+  };
+}
+
+// ═══════════════════════════════════════════════════════
+// BUILD PIVOT
+// Rules:
+//  - If a PO appears under >1 distinct eGBS values → standalone (point 6)
+//  - If a PO has empty/null eGBS → standalone (point 6)
+//  - Standalone POs get a unique key '__SOLO__<po>' so they have no siblings
+// ═══════════════════════════════════════════════════════
+function buildPivotFromRaw(ws,colMap){
+  const raw=XLSX.utils.sheet_to_json(ws,{defval:null,raw:true});
+  if(!raw.length)return null;
+  const{eGBSCol,poCol,activityPeriodCol,amtCol,invDtCol}=colMap;
+  if(!poCol||!activityPeriodCol||!amtCol)return null;
+
+  // Pass 1: collect eGBS-per-PO mapping
+  const poEgbsMap={}; // po -> Set<egbs>
+  raw.forEach(row=>{
+    const po=String(row[poCol]??"").trim();if(!po)return;
+    const eg=eGBSCol?String(row[eGBSCol]??"").trim():"";
+    if(!poEgbsMap[po])poEgbsMap[po]=new Set();
+    if(eg)poEgbsMap[po].add(eg);
+  });
+  // Determine standalone POs: multiple eGBS or no eGBS
+  const standalonePOs=new Set();
+  Object.entries(poEgbsMap).forEach(([po,egSet])=>{
+    if(egSet.size!==1)standalonePOs.add(po);
+  });
+
+  // Pass 2: build pivot
+  const pivot={}; // pivot[egbsKey][po][mk]={amt,invDts}
+  const monthsUsed=new Set();
+
+  raw.forEach(row=>{
+    const po=String(row[poCol]??"").trim();if(!po)return;
+    const mk=parseActivityPeriod(row[activityPeriodCol]);
+    const amt=parseAmt(row[amtCol]);
+    if(!mk||!ALL_MONTHS.includes(mk))return;
+    monthsUsed.add(mk);
+
+    const eg=eGBSCol?String(row[eGBSCol]??"").trim():"";
+    // Use unique solo key for standalones so they never share siblings
+    const egKey=standalonePOs.has(po)?`__SOLO__${po}`:(eg||`__SOLO__${po}`);
+
+    if(!pivot[egKey])pivot[egKey]={};
+    if(!pivot[egKey][po])pivot[egKey][po]={};
+    if(!pivot[egKey][po][mk])pivot[egKey][po][mk]={amt:0,invDts:[]};
+    pivot[egKey][po][mk].amt+=amt;
+    if(invDtCol&&row[invDtCol]){
+      const d=row[invDtCol];
+      const ds=typeof d==="number"?XLSX.SSF.format("yyyy-mm-dd",d):String(d).trim();
+      if(ds)pivot[egKey][po][mk].invDts.push(ds);
+    }
+  });
+
+  const mKeys=ALL_MONTHS.filter(m=>monthsUsed.has(m));
+  const monthKeys=mKeys.length>=2?mKeys:ALL_MONTHS;
+
+  const records=[];
+  Object.entries(pivot).forEach(([egKey,pos])=>{
+    const displayEgbs=egKey.startsWith("__SOLO__")?"(standalone)":egKey;
+    Object.entries(pos).forEach(([po,mdata])=>{
+      const months={},invMonths={};
+      monthKeys.forEach(mk=>{months[mk]=mdata[mk]?.amt||0;invMonths[mk]=mdata[mk]?.invDts||[];});
+      records.push({egbs:displayEgbs,egKey,po,months,invMonths});
+    });
+  });
+  return{records,monthKeys};
+}
+
+// ═══════════════════════════════════════════════════════
+// MATH
+// ═══════════════════════════════════════════════════════
+function medianOf(arr){
+  if(!arr.length)return 0;
+  const s=[...arr].sort((a,b)=>a-b);
+  const m=Math.floor(s.length/2);
+  return s.length%2?s[m]:(s[m-1]+s[m])/2;
+}
+// Base rate: lower-cluster median (ignores catch-up months)
+function baseRate(amounts){
+  const nz=[...amounts.filter(x=>x>0)].sort((a,b)=>a-b);
+  if(!nz.length)return 0;
+  if(nz.length===1)return nz[0];
+  let cut=nz.length;
+  for(let i=1;i<nz.length;i++){if(nz[i]>=nz[i-1]*1.4){cut=i;break;}}
+  if(cut===nz.length)cut=Math.max(1,Math.ceil(nz.length*0.6));
+  return medianOf(nz.slice(0,cut));
+}
+function near(val,tgt,pct){return tgt>0&&Math.abs(val-tgt)<=pct*tgt;}
+function fmt(n){return n?new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:0}).format(n):"-";}
+function fmtS(n){
+  if(!n)return "—";
+  if(Math.abs(n)>=1000000)return "$"+(n/1e6).toFixed(1)+"M";
+  if(Math.abs(n)>=1000)return "$"+(n/1000).toFixed(0)+"k";
+  return "$"+Math.round(n);
+}
+
+// ═══════════════════════════════════════════════════════
+// BILLING TYPE DETECTION
+// minGap=1 → monthly (any 2 consecutive months = monthly service)
+// ═══════════════════════════════════════════════════════
+function detectBilling(amounts){
+  const idx=amounts.map((v,i)=>v>0?i:-1).filter(i=>i>=0);
+  if(idx.length<=1)return{type:"annual",gap:12};
+  const gaps=[];
+  for(let i=1;i<idx.length;i++)gaps.push(idx[i]-idx[i-1]);
+  const minGap=Math.min(...gaps);
+  const med=medianOf(gaps);
+  if(minGap<=1)return{type:"monthly",gap:1};
+  if(med>=9||idx.length<=2)return{type:"annual",gap:Math.round(med)||12};
+  if(med>=2.5)return{type:"quarterly",gap:Math.round(med)};
+  return{type:"monthly",gap:1};
+}
+
+// ═══════════════════════════════════════════════════════
+// GAP CANDIDATES
+// Only gaps at index >= FLAG_FROM_IDX are flagged (point 3)
+// ═══════════════════════════════════════════════════════
+function gapCandidates(amounts,billing,first,last,isMain){
+  const{type,gap}=billing;
+  const c=new Set();
+  const lastIdx=amounts.length-1;
+  // Effective last index to flag: current month (not beyond)
+  const flagEnd=CUR_IDX>=0?Math.min(CUR_IDX,lastIdx):lastIdx;
+
+  if(type==="annual"){
+    const next=last+gap;
+    if(next<=flagEnd&&next>=FLAG_FROM_IDX&&amounts[next]===0)c.add(next);
+    return c;
+  }
+  if(type==="quarterly"){
+    let pos=first;
+    while(pos+gap<=flagEnd){
+      pos+=gap;
+      const win=[pos-1,pos,pos+1].filter(x=>x>=0&&x<amounts.length);
+      if(pos>=FLAG_FROM_IDX&&!win.some(x=>amounts[x]>0))c.add(pos);
+    }
+    return c;
+  }
+  // Monthly: every zero in active range
+  for(let i=Math.max(first,FLAG_FROM_IDX);i<=last;i++){
+    if(amounts[i]===0)c.add(i);
+  }
+  // Trailing: main PO trails to current month; sibling POs trail only if recently active
+  if(isMain){
+    for(let gi=Math.max(last+1,FLAG_FROM_IDX);gi<=flagEnd;gi++)c.add(gi);
+  } else {
+    for(let gi=Math.max(last+1,FLAG_FROM_IDX);gi<=flagEnd;gi++){
+      const ws=Math.max(0,gi-4);
+      if(amounts.slice(ws,gi).filter(x=>x>0).length>=2)c.add(gi);else break;
+    }
+  }
+  return c;
+}
+
+function toRuns(sorted){
+  if(!sorted.length)return[];
+  const runs=[[sorted[0]]];
+  for(let i=1;i<sorted.length;i++){
+    sorted[i]===sorted[i-1]+1?runs[runs.length-1].push(sorted[i]):runs.push([sorted[i]]);
+  }
+  return runs;
+}
+
+// ═══════════════════════════════════════════════════════
+// RESOLVE ALL GAPS — per run, no sub-run matching
+//
+// For each run of N consecutive gaps:
+//   1. Cross-eGBS: find sibling payment ≈ N×typ (±25%)
+//      in same or FUTURE month (delta 0 → lookahead) — NO backward
+//   2. Same-PO: find payment ≈ N×typ (±20%) in a FUTURE month
+//   3. N=1 only: same-month sibling ≈ 1×typ (±50%)
+//   4. No match → entire run = YELLOW
+//
+// KEY: if payment covers only M < N months, run stays yellow (point 5)
+//
+// Current-month gap: no backward catchup possible (point 4)
+//   Since delta starts at 0 and same-PO only looks forward, this is
+//   naturally handled — current month's only forward option is future data
+//   which doesn't exist yet → yellow if no sibling covers same month.
+// ═══════════════════════════════════════════════════════
+function resolveAllGaps(gapSet,amounts,monthKeys,typ,sibs,lookahead){
+  const gaps=[...gapSet].sort((a,b)=>a-b);
+  const flagged={};
+  const usedSibPayments=new Set();
+  const covered=new Set();
+  const runs=toRuns(gaps);
+
+  // ── PASS A: Full-run consolidated checks ─────────────────────────────
+  // A run of N gaps is marked ORANGE only if a SINGLE payment covering
+  // the ENTIRE run (N×typ) is found. Partial coverage → run stays uncovered
+  // here and falls through to Pass B for individual per-gap checks.
+  runs.forEach(run=>{
+    const N=run.length;
+    const lastGi=run[N-1];
+    let runCovered=false;
+
+    // A1. Cross-eGBS: sibling has N×typ (±25%) in same or future month
+    //     delta starts at 0 — NO backward search (point 4 fix)
+    for(let delta=0;delta<=lookahead&&!runCovered;delta++){
+      const ti=lastGi+delta;
+      if(ti<0||ti>=amounts.length)continue;
+      for(const sib of sibs){
+        const payKey=`${sib.po}:${ti}`;
+        if(usedSibPayments.has(payKey))continue;
+        const sibAmt=sib.months[monthKeys[ti]]??0;
+        if(sibAmt<=0)continue;
+        // checkN >= N: full-run coverage only, not partial (point 5 fix)
+        for(let checkN=N;checkN<=N+3;checkN++){
+          if(near(sibAmt,checkN*typ,0.25)){
+            const note=`${checkN}-month billing in ${sib.po} (${fmt(sibAmt)}) at ${monthKeys[ti]} — cross-eGBS consolidation (±25% of ${fmt(checkN*typ)})`;
+            usedSibPayments.add(payKey);
+            run.forEach(g=>{flagged[g]={status:"catchup",note};covered.add(g);});
+            runCovered=true;break;
+          }
+        }
+        if(runCovered)break;
+      }
+    }
+    if(runCovered)return;
+
+    // A2. Same-PO: N×typ (±20%) in a FUTURE month only
+    for(let a=1;a<=lookahead&&!runCovered;a++){
+      const ti=lastGi+a;
+      if(ti>=amounts.length)break;
+      const fa=amounts[ti];if(fa<=0)continue;
+      for(let checkN=N;checkN<=N+3;checkN++){
+        if(near(fa,checkN*typ,0.20)){
+          const note=`${checkN}-month billing on same PO at ${monthKeys[ti]} (${fmt(fa)}) — covers ${checkN-1} missed month(s) (±20% of ${fmt(checkN*typ)})`;
+          run.forEach(g=>{flagged[g]={status:"catchup",note};covered.add(g);});
+          runCovered=true;break;
+        }
+      }
+      if(runCovered)break;
+    }
+    // If consolidated check failed, run stays uncovered → Pass B handles each gap individually
+  });
+
+  // ── PASS B: Individual per-gap checks for all uncovered gaps ──────────
+  // B1. Same-month sibling ≈ 1×typ (±50%)
+  //     Applied to ALL uncovered gaps regardless of run length.
+  //     This correctly handles: sibling PO has individual monthly payments
+  //     in each missing month (e.g. eGBS 30458 Oct/Nov/Dec each covered 1:1).
+  gaps.filter(gi=>!covered.has(gi)).forEach(gi=>{
+    for(const sib of sibs){
+      const payKey=`${sib.po}:${gi}`;
+      if(usedSibPayments.has(payKey))continue;
+      const sibAmt=sib.months[monthKeys[gi]]??0;
+      if(sibAmt>0&&near(sibAmt,typ,0.50)){
+        usedSibPayments.add(payKey);covered.add(gi);
+        flagged[gi]={status:"catchup",note:`Covered by ${sib.po} (${fmt(sibAmt)}) in ${monthKeys[gi]} — renewal/replacement PO (±50% of ${fmt(typ)})`};
+        return;
+      }
+    }
+  });
+
+  // B2. Remaining uncovered → true gap (yellow)
+  gaps.filter(gi=>!covered.has(gi)).forEach(gi=>{
+    const nzIdx=amounts.map((v,i)=>v>0?i:-1).filter(i=>i>=0);
+    const lastNz=nzIdx.length?nzIdx[nzIdx.length-1]:-1;
+    flagged[gi]={
+      status:"gap",
+      note:gi>lastNz
+        ?`${monthKeys[gi]} missing — PO was active in prior months, expected ~${fmt(typ)}/month`
+        :`Missing ~${fmt(typ)}/month. No coverage found on this or sibling POs.`
+    };
+  });
+
+  return flagged;
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN ANALYSIS
+// ═══════════════════════════════════════════════════════
+function analyzeAll(records,monthKeys){
+  // Group by egKey
+  const byEg={};
+  records.forEach(r=>{
+    if(!byEg[r.egKey])byEg[r.egKey]=[];
+    byEg[r.egKey].push(r);
+  });
+
+  const all=[];
+
+  Object.entries(byEg).forEach(([egKey,pos])=>{
+    // eGBS-level billing type: if any PO is monthly → all monthly
+    const billings=pos.map(po=>detectBilling(monthKeys.map(mk=>po.months[mk]??0)));
+    const egBillingType=billings.some(b=>b.type==="monthly")?"monthly"
+      :billings.some(b=>b.type==="quarterly")?"quarterly":"annual";
+    const egGap=egBillingType==="monthly"?1:billings.find(b=>b.type===egBillingType)?.gap||3;
+    const egBilling={type:egBillingType,gap:egGap};
+
+    // Main PO: most billing months (need ≥3)
+    const nzCounts=pos.map(po=>monthKeys.filter(mk=>(po.months[mk]??0)>0).length);
+    const maxNz=Math.max(...nzCounts);
+    const mainIdx=maxNz>=3
+      ?nzCounts.reduce((bi,cnt,i)=>{
+          if(cnt<maxNz)return bi;
+          const lA=monthKeys.map((mk,mi)=>(pos[i].months[mk]??0)>0?mi:-1).filter(x=>x>=0).slice(-1)[0]??-1;
+          const lB=monthKeys.map((mk,mi)=>(pos[bi].months[mk]??0)>0?mi:-1).filter(x=>x>=0).slice(-1)[0]??-1;
+          return lA>=lB?i:bi;
+        },0)
+      :0;
+
+    pos.forEach((po,pi)=>{
+      const amounts=monthKeys.map(mk=>po.months[mk]??0);
+      const nzIdx=amounts.map((v,i)=>v>0?i:-1).filter(i=>i>=0);
+      const isMain=pi===mainIdx;
+      const billing=egBilling;
+
+      // Sibling list: ALL other POs in this eGBS group
+      // (even ≤3 month POs participate as siblings — point 5 fix)
+      const sibs=pos.filter((_,i)=>i!==pi).map(p=>({
+        po:p.po,
+        months:monthKeys.reduce((o,mk)=>{o[mk]=p.months[mk]??0;return o;},{}),
+        invMonths:p.invMonths||{}
+      }));
+
+      // No billing data
+      if(!nzIdx.length){
+        all.push({egbs:po.egbs,po:po.po,amounts,flagged:{},monthKeys,typ:0,billing,hasFlag:false,invMonths:po.invMonths||{},isMain,skipReason:"No billing data"});
+        return;
+      }
+      // ≤3 billing months: skip own gap analysis (point 5)
+      // but still in sibling list for other POs (handled above)
+      if(nzIdx.length<=3){
+        all.push({egbs:po.egbs,po:po.po,amounts,flagged:{},monthKeys,typ:baseRate(amounts),billing,hasFlag:false,invMonths:po.invMonths||{},isMain,skipReason:"≤3 billing months — skipped (still serves as sibling for other POs)"});
+        return;
+      }
+
+      const first=nzIdx[0],last=nzIdx[nzIdx.length-1];
+
+      // Base rate: use only amounts from FLAG_FROM_IDX (Jul-25) onwards.
+      // This prevents inflation from earlier months that may have had higher billing.
+      const windowAmts=amounts.filter((_,i)=>{
+        const mi=ALL_MONTHS.indexOf(monthKeys[i]);
+        return mi>=FLAG_FROM_IDX&&amounts[i]>0;
+      });
+      const typ=windowAmts.length>=3?baseRate(windowAmts):baseRate(amounts.filter(x=>x>0));
+      if(typ===0){
+        all.push({egbs:po.egbs,po:po.po,amounts,flagged:{},monthKeys,typ:0,billing,hasFlag:false,invMonths:po.invMonths||{},isMain,skipReason:"Zero amount"});
+        return;
+      }
+
+      const lookahead=billing.type==="quarterly"?billing.gap+1:3;
+      const cands=gapCandidates(amounts,billing,first,last,isMain);
+      let flagged={};
+      if(cands.size>0)flagged=resolveAllGaps(cands,amounts,monthKeys,typ,sibs,lookahead);
+
+      all.push({egbs:po.egbs,po:po.po,amounts,flagged,monthKeys,typ,billing,hasFlag:Object.keys(flagged).length>0,invMonths:po.invMonths||{},isMain,skipReason:null});
+    });
+  });
+  return all;
+}
+
+// ═══════════════════════════════════════════════════════
+// EXCEL EXPORT
+// Point 1: white background for normal cells, no blue
+// ═══════════════════════════════════════════════════════
+async function exportExcel(allRows,monthKeys,fileName){
+  const wb=new ExcelJS.Workbook();
+  const ws=wb.addWorksheet("PO Gap Report");
+  const fill=(c,h)=>{c.fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF"+h}};};
+  const fnt=(c,h,bold=false,sz=10)=>{c.font={color:{argb:"FF"+h},bold,size:sz,name:"Calibri"};};
+  const bdr=(c)=>{const e={style:"thin",color:{argb:"FFCCCCCC"}};c.border={top:e,left:e,bottom:e,right:e};};
+  const wht="FFFFFF";
+
+  // Header
+  const hdr=ws.addRow(["Parent eGBS","PO Number","Billing",...monthKeys,"Issues"]);
+  hdr.height=24;
+  hdr.eachCell(c=>{fill(c,"1F3864");fnt(c,"FFFFFF",true,10);c.alignment={vertical:"middle",horizontal:"center",wrapText:true};bdr(c);});
+  hdr.getCell(1).alignment={vertical:"middle",horizontal:"left"};
+  hdr.getCell(2).alignment={vertical:"middle",horizontal:"left"};
+
+  ws.getColumn(1).width=22;ws.getColumn(2).width=22;ws.getColumn(3).width=13;
+  monthKeys.forEach((_,i)=>{ws.getColumn(i+4).width=11;});
+  ws.getColumn(monthKeys.length+4).width=65;
+  ws.views=[{state:"frozen",xSplit:3,ySplit:1,activeCell:"D2"}];
+
+  // Highlight current month column header
+  const curColIdx=monthKeys.indexOf(CURRENT_MONTH);
+  if(curColIdx>=0){
+    const hc=hdr.getCell(curColIdx+4);
+    fill(hc,"2E4A2E");fnt(hc,"88FF88",true,10);
+  }
+
+  allRows.forEach(r=>{
+    const issues=Object.entries(r.flagged)
+      .map(([gi,fl])=>`[${r.monthKeys[gi]}] ${fl.status==="gap"?"⚠ GAP":"✓ COVERED"}: ${fl.note}`)
+      .join("  |  ");
+
+    const row=ws.addRow([
+      r.egbs==="(standalone)"?"(standalone)":r.egbs,
+      r.po,
+      "",
+      ...r.amounts,
+      issues||(r.skipReason?"⊘ "+r.skipReason:"✓ No issues")
+    ]);
+    row.height=18;
+
+    // eGBS and PO cells — white background
+    fill(row.getCell(1),wht);fnt(row.getCell(1),"1565C0",true,10);bdr(row.getCell(1));
+    fill(row.getCell(2),wht);fnt(row.getCell(2),"222222",false,10);bdr(row.getCell(2));
+
+    // Billing cell
+    const bilColors={monthly:"2196F3",quarterly:"9C27B0",annual:"FF9800",none:"888888"};
+    fill(row.getCell(3),wht);
+    fnt(row.getCell(3),bilColors[r.billing.type]||"888888",r.isMain,9);
+    row.getCell(3).value=(r.isMain?"★ ":"")+r.billing.type.toUpperCase();
+    row.getCell(3).alignment={horizontal:"center",vertical:"middle"};bdr(row.getCell(3));
+
+    // Month cells — white by default (point 1)
+    r.amounts.forEach((amt,i)=>{
+      const cell=row.getCell(i+4);
+      const flag=r.flagged[i];
+      const isCurMon=r.monthKeys[i]===CURRENT_MONTH;
+      const invDts=r.invMonths[r.monthKeys[i]]||[];
+      const invNote=invDts.length?`\nInv: ${[...new Set(invDts)].join(", ")}`:"";
+
+      if(flag){
+        // YELLOW = gap, ORANGE = covered
+        fill(cell,flag.status==="gap"?"FFFF00":"FFA500");
+        fnt(cell,"000000",true);
+        cell.value=amt>0?amt:0;
+        try{cell.note={texts:[{text:flag.note+invNote,font:{size:9,name:"Calibri"}}]};}catch(e){}
+      } else if(amt>0){
+        // White background, black text — current month column gets subtle green tint
+        fill(cell,isCurMon?"F0FFF0":wht);
+        fnt(cell,"000000");
+        cell.value=amt;
+        if(invNote){try{cell.note={texts:[{text:"Billing OK"+invNote,font:{size:9}}]};}catch(e){}}
+      } else {
+        // Empty — plain white
+        fill(cell,isCurMon?"FAFFF8":wht);
+        fnt(cell,"CCCCCC");
+        cell.value="";
+      }
+      cell.numFmt="#,##0";
+      cell.alignment={horizontal:"right",vertical:"middle"};
+      bdr(cell);
+    });
+
+    // Issues cell
+    const sc=row.getCell(monthKeys.length+4);
+    sc.value=issues||(r.skipReason?"⊘ "+r.skipReason:"✓ No issues");
+    sc.alignment={wrapText:true,vertical:"top"};
+    fill(sc,wht);
+    if(r.skipReason)fnt(sc,"AAAAAA",false,9);
+    else if(issues)fnt(sc,"CC7700",false,9);
+    else fnt(sc,"008800",false,9);
+    bdr(sc);
+  });
+
+  // Legend
+  const leg=wb.addWorksheet("Legend");
+  leg.getColumn(1).width=32;leg.getColumn(2).width=72;
+  [
+    ["Color","Explanation"],
+    ["🟡 YELLOW — Gap","Billing is MISSING for this month. Not found on this PO or any sibling PO under the same Parent eGBS. Check if accrual is needed."],
+    ["🟠 ORANGE — Covered","Billing accounted for: same PO billed N months together in a FUTURE month (±20%), OR a sibling PO has N×typical billing in a same/future month (±25%)."],
+    ["🟢 Very light green — Current month","Current month column ("+CURRENT_MONTH+") is tinted to make it easy to find."],
+    ["White — Normal spend","Regular billing present. No issue."],
+    ["",""],
+    ["Analysis window","Data displayed from "+ALL_MONTHS[0]+". Gaps FLAGGED only from "+FLAG_START_LABEL+" to "+CURRENT_MONTH+". Pre-"+FLAG_START_LABEL+" gaps are not highlighted."],
+    ["Catch-up direction","Catch-up for a gap can only be in the SAME or FUTURE months — never previous months. Current month gap can only be covered by a sibling in the same month (no future data yet)."],
+    ["Full-run coverage rule","A run of N consecutive gaps is marked ORANGE only if a payment ≈ N×typical is found. If only M×typical (M<N) is found, the entire run stays YELLOW."],
+    ["No backward delta","Cross-eGBS catch-up only looks at same or future months (delta 0 to lookahead). No backward search."],
+    ["≤3 billing months","PO's own gaps are not analyzed (insufficient pattern data). However, it STILL serves as a sibling for other POs in the same Parent eGBS — its billing is checked for cross-PO coverage."],
+    ["Standalone POs","POs with no Parent eGBS, or appearing under multiple different eGBS values, are treated as standalone with no siblings."],
+    ["★ Main PO","PO with most billing months in the eGBS group. Its trailing gaps extend to current month."],
+  ].forEach((row,ri)=>{
+    const lr=leg.addRow(row);lr.height=ri<=4?22:20;
+    const e={style:"thin",color:{argb:"FFCCCCCC"}};
+    if(ri===0){lr.eachCell(c=>{fill(c,"1F3864");fnt(c,"FFFFFF",true);});}
+    else if(ri===1){fill(lr.getCell(1),"FFFF00");fnt(lr.getCell(1),"000000",true);}
+    else if(ri===2){fill(lr.getCell(1),"FFA500");fnt(lr.getCell(1),"000000",true);}
+    else if(ri===3){fill(lr.getCell(1),"F0FFF0");fnt(lr.getCell(1),"006600",true);}
+    else if(ri===4){fill(lr.getCell(1),"FFFFFF");fnt(lr.getCell(1),"000000",true);}
+    else if(row[0]){fnt(lr.getCell(1),"1565C0",true);fnt(lr.getCell(2),"555555");}
+    lr.eachCell(c=>{c.border={top:e,left:e,bottom:e,right:e};c.alignment={vertical:"top",wrapText:true};});
+  });
+
+  const buf=await wb.xlsx.writeBuffer();
+  const blob=new Blob([buf],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;
+  a.download=(fileName||"Report").replace(/\.xlsx$/i,"")+`_GAP_${CURRENT_MONTH.replace("-","")}.xlsx`;
+  a.click();URL.revokeObjectURL(url);
+}
+
+// ═══════════════════════════════════════════════════════
+// UI HELPERS
+// ═══════════════════════════════════════════════════════
+const FS={
+  gap:    {bg:"#FFD700",text:"#000",border:"#B8860B",label:"⚠ Gap"},
+  catchup:{bg:"#FF8C00",text:"#fff",border:"#cc5500",label:"↑ Covered"},
+};
+const BC={monthly:"#4fc3f7",quarterly:"#a78bfa",annual:"#fb923c",none:"#555"};
+const M="'JetBrains Mono','Courier New',monospace";
+const btn=(bg,bd,col,fw)=>({background:bg,border:`1px solid ${bd}`,borderRadius:7,color:col,padding:"7px 13px",fontSize:11,cursor:"pointer",fontFamily:M,fontWeight:fw||400});
+
+function ColMapper({headers,colMap,onChange}){
+  const fields=[
+    {key:"eGBSCol",          label:"Parent eGBS column",   required:true},
+    {key:"poCol",            label:"Purchase Order column", required:true},
+    {key:"activityPeriodCol",label:"Activity Period column",required:true},
+    {key:"amtCol",           label:"Amount column",        required:true},
+    {key:"invDtCol",         label:"Invoice Date (optional)",required:false},
+  ];
+  return(
+    <div style={{background:"#0d1219",border:"1px solid #2a3560",borderRadius:10,padding:16,marginBottom:16}}>
+      <div style={{fontSize:12,color:"#4fc3f7",fontWeight:700,marginBottom:12}}>📋 Column Mapping — confirm before running</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+        {fields.map(f=>(
+          <div key={f.key} style={{display:"flex",flexDirection:"column",gap:4}}>
+            <label style={{fontSize:10,color:f.required?"#9fa8da":"#5a6a8a"}}>{f.label}{f.required?" *":""}</label>
+            <select value={colMap[f.key]||""} onChange={e=>onChange({...colMap,[f.key]:e.target.value||null})}>
+              <option value="">{f.required?"-- select --":"-- none --"}</option>
+              {headers.map(h=><option key={h} value={h}>{h}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+      <div style={{marginTop:10,fontSize:10,color:"#4a5580"}}>* Required. Auto-detected from column names.</div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════
+// APP
+// ═══════════════════════════════════════════════════════
+function App(){
+  const [stage,setStage]          =useState("upload");
+  const [rawWb,setRawWb]          =useState(null);
+  const [rawSheet,setRawSheet]    =useState(null);
+  const [sheetName,setSheetName]  =useState("");
+  const [sheetNames,setSheetNames]=useState([]);
+  const [headers,setHeaders]      =useState([]);
+  const [colMap,setColMap]        =useState({});
+  const [parsed,setParsed]        =useState(null);
+  const [allRows,setAllRows]      =useState([]);
+  const [loading,setLoading]      =useState(false);
+  const [error,setError]          =useState("");
+  const [filter,setFilter]        =useState("all");
+  const [search,setSearch]        =useState("");
+  const [expanded,setExpanded]    =useState({});
+  const [fileName,setFileName]    =useState("");
+  const [exporting,setExp]        =useState(false);
+
+  const loadSheet=useCallback((workbook,name)=>{
+    try{
+      const ws=workbook.Sheets[name];
+      const rows=XLSX.utils.sheet_to_json(ws,{defval:null,header:1,raw:true});
+      let hdrIdx=0;
+      for(let i=0;i<Math.min(10,rows.length);i++){
+        if(rows[i].filter(v=>v!=null&&v!=="").length>3){hdrIdx=i;break;}
+      }
+      const hdrs=rows[hdrIdx].map((v,i)=>v!=null&&String(v).trim()?String(v).trim():`Col_${i+1}`);
+      setHeaders(hdrs);setRawSheet(ws);setSheetName(name);
+      setColMap(autoDetectCols(hdrs));setStage("mapping");
+    }catch(e){setError("Sheet error: "+e.message);}
+    finally{setLoading(false);}
+  },[]);
+
+  const handleFile=useCallback(async file=>{
+    if(!file)return;
+    setLoading(true);setError("");setFileName(file.name);
+    setStage("upload");setAllRows([]);setParsed(null);setExpanded({});
+    try{
+      const buf=await file.arrayBuffer();
+      const workbook=XLSX.read(buf,{type:"array",cellDates:false});
+      setRawWb(workbook);setSheetNames(workbook.SheetNames);
+      const best=workbook.SheetNames.find(n=>/services|fdw|data|raw|detail/i.test(n))||workbook.SheetNames[0];
+      loadSheet(workbook,best);
+    }catch(e){setError("File read error: "+e.message);setLoading(false);}
+  },[loadSheet]);
+
+  const onDrop=useCallback(e=>{e.preventDefault();const f=e.dataTransfer?.files?.[0];if(f)handleFile(f);},[handleFile]);
+
+  const runAnalysis=useCallback(()=>{
+    if(!rawSheet)return;
+    setLoading(true);setError("");
+    try{
+      const result=buildPivotFromRaw(rawSheet,colMap);
+      if(!result||!result.records.length)throw new Error("Could not build pivot. Please check column mapping.");
+      setParsed(result);setAllRows(analyzeAll(result.records,result.monthKeys));setStage("results");
+    }catch(e){setError(e.message);}
+    finally{setLoading(false);}
+  },[rawSheet,colMap]);
+
+  const doExport=async()=>{
+    if(!allRows.length||!parsed)return;
+    setExp(true);
+    try{await exportExcel(allRows,parsed.monthKeys,fileName);}
+    catch(e){alert("Export error: "+e.message);}
+    finally{setExp(false);}
+  };
+
+  const reset=()=>{setStage("upload");setRawWb(null);setRawSheet(null);setHeaders([]);setColMap({});setParsed(null);setAllRows([]);setError("");setFileName("");setExpanded({});setFilter("all");setSearch("");};
+  const toggleAll=open=>{const m={};shown.forEach(r=>{m[`${r.egbs}:${r.po}`]=open;});setExpanded(m);};
+
+  const shown=useMemo(()=>allRows.filter(r=>{
+    const mf=filter==="all"?true
+      :filter==="flagged"?r.hasFlag
+      :filter==="gap"?Object.values(r.flagged).some(f=>f.status==="gap")
+      :filter==="catchup"?Object.values(r.flagged).some(f=>f.status==="catchup")
+      :filter==="clean"?(!r.hasFlag&&!r.skipReason)
+      :!!r.skipReason;
+    const ms=!search
+      ||r.egbs.toLowerCase().includes(search.toLowerCase())
+      ||r.po.toLowerCase().includes(search.toLowerCase());
+    return mf&&ms;
+  }),[allRows,filter,search]);
+
+  const sum=useMemo(()=>{
+    let gaps=0,catchups=0,clean=0,skipped=0,monthly=0,quarterly=0,annual=0;
+    allRows.forEach(r=>{
+      Object.values(r.flagged).forEach(f=>f.status==="gap"?gaps++:catchups++);
+      if(r.skipReason)skipped++;else if(!r.hasFlag)clean++;
+      if(r.billing.type==="monthly")monthly++;
+      else if(r.billing.type==="quarterly")quarterly++;
+      else if(r.billing.type==="annual")annual++;
+    });
+    return{total:allRows.length,gaps,catchups,clean,skipped,flagged:allRows.filter(r=>r.hasFlag).length,monthly,quarterly,annual};
+  },[allRows]);
+
+  const canRun=!!(colMap.eGBSCol&&colMap.poCol&&colMap.activityPeriodCol&&colMap.amtCol);
+
+  return(
+    <div style={{minHeight:"100vh",background:"#0f1117",color:"#e8e8e8",fontFamily:M}}>
+
+      {/* HEADER */}
+      <div style={{background:"linear-gradient(135deg,#1a1d2e,#0f1117)",borderBottom:"1px solid #2a2d3e",padding:"14px 20px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{width:32,height:32,background:"linear-gradient(135deg,#4fc3f7,#0288d1)",borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>📊</div>
+        <div>
+          <div style={{fontSize:15,fontWeight:700,color:"#fff"}}>
+            PO Gap Analyzer&nbsp;
+            <span style={{fontSize:10,color:"#4fc3f7",border:"1px solid #4fc3f744",borderRadius:4,padding:"1px 6px"}}>eGBS Edition v2</span>
+          </div>
+          <div style={{fontSize:9,color:"#6c7aa0",letterSpacing:1}}>
+            RANGE: {ALL_MONTHS[0]} → {CURRENT_MONTH}&nbsp;·&nbsp;
+            FLAGS FROM: {FLAG_START_LABEL}&nbsp;·&nbsp;
+            PARENT eGBS GROUPING
+          </div>
+        </div>
+        {stage==="results"&&(
+          <div style={{marginLeft:"auto",display:"flex",gap:8,flexWrap:"wrap"}}>
+            <button onClick={()=>toggleAll(true)}  style={btn("#1a1d2e","#2a3560","#9fa8da")}>⊞ Expand All</button>
+            <button onClick={()=>toggleAll(false)} style={btn("#1a1d2e","#2a3560","#9fa8da")}>⊟ Collapse All</button>
+            <button onClick={doExport} disabled={exporting}
+              style={btn(exporting?"#1a2a1a":"#1b5e20","#4caf50",exporting?"#555":"#fff",700)}>
+              {exporting?"⏳ Exporting…":"⬇ Export Excel with Highlights"}
+            </button>
+            <button onClick={reset} style={btn("#1a1d2e","#2a3560","#9fa8da")}>↩ New File</button>
+          </div>
+        )}
+      </div>
+
+      <div style={{padding:"18px 20px"}}>
+
+        {/* UPLOAD */}
+        {stage==="upload"&&!loading&&(
+          <div onDrop={onDrop} onDragOver={e=>e.preventDefault()}
+            onClick={()=>document.getElementById("fi").click()}
+            style={{border:"2px dashed #2a3560",borderRadius:12,padding:"50px 36px",textAlign:"center",background:"#13162a",cursor:"pointer"}}>
+            <div style={{fontSize:40,marginBottom:10}}>📂</div>
+            <div style={{fontSize:15,fontWeight:600,color:"#c5cae9",marginBottom:6}}>Drop your RAW data Excel file here</div>
+            <div style={{fontSize:11,color:"#4a5580",marginBottom:4}}>
+              Flagging gaps: <b style={{color:"#FFD700"}}>{FLAG_START_LABEL}</b> → <b style={{color:"#4fc3f7"}}>{CURRENT_MONTH}</b>
+            </div>
+            <div style={{fontSize:11,color:"#3a5570",marginBottom:18}}>Needs: Parent eGBS · Purchase Order · Activity Period · Amount · (optional) Invoice Date</div>
+            <div style={{display:"inline-block",background:"linear-gradient(135deg,#1565c0,#0d47a1)",color:"#fff",padding:"9px 24px",borderRadius:7,fontSize:13,fontWeight:600}}>CHOOSE FILE</div>
+            <input id="fi" type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+          </div>
+        )}
+
+        {loading&&<div style={{textAlign:"center",padding:44}}><div style={{fontSize:28,marginBottom:8}}>⚙️</div><div style={{color:"#4fc3f7",fontSize:13}}>Processing {fileName}…</div></div>}
+        {error&&<div style={{background:"#1e0a0a",border:"1px solid #8b0000",borderRadius:9,padding:13,color:"#ff6b6b",fontSize:12,marginTop:12}}>⚠ {error}</div>}
+
+        {/* MAPPING */}
+        {stage==="mapping"&&!loading&&(
+          <div>
+            <div style={{background:"#0d1219",border:"1px solid #2a2d3e",borderRadius:8,padding:"10px 14px",marginBottom:14,display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
+              <span style={{fontSize:12,color:"#4fc3f7",fontWeight:700}}>📄 {fileName}</span>
+              {sheetNames.length>1&&(
+                <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{fontSize:10,color:"#4a5580"}}>Sheet:</span>
+                  {sheetNames.map(s=>(
+                    <button key={s} onClick={()=>{setLoading(true);loadSheet(rawWb,s);}}
+                      style={btn(s===sheetName?"#1565c0":"#13162a",s===sheetName?"#4fc3f7":"#2a3560",s===sheetName?"#fff":"#9fa8da")}>{s}</button>
+                  ))}
+                </div>
+              )}
+              <span style={{fontSize:10,color:"#3a4a5a",marginLeft:"auto"}}>{headers.length} columns</span>
+            </div>
+            <ColMapper headers={headers} colMap={colMap} onChange={setColMap}/>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={runAnalysis} disabled={!canRun}
+                style={btn(canRun?"linear-gradient(135deg,#1565c0,#0d47a1)":"#1a1d2e",canRun?"#4fc3f7":"#2a3560",canRun?"#fff":"#555",700)}>
+                {canRun?"▶ Run Gap Analysis":"⚠ Map all required columns"}
+              </button>
+              <button onClick={reset} style={btn("#1a1d2e","#2a3560","#9fa8da")}>↩ Back</button>
+            </div>
+          </div>
+        )}
+
+        {/* RESULTS */}
+        {stage==="results"&&(
+          <>
+            {/* Summary */}
+            <div style={{display:"flex",gap:8,marginBottom:13,flexWrap:"wrap"}}>
+              {[
+                {l:"Total POs",    v:sum.total,    ic:"📋",c:"#4fc3f7"},
+                {l:"Clean",        v:sum.clean,    ic:"✓", c:"#4CAF50"},
+                {l:"True Gaps",    v:sum.gaps,     ic:"⚠", c:"#FFD700"},
+                {l:"Covered",      v:sum.catchups, ic:"↑", c:"#FF8C00"},
+                {l:"Skipped",      v:sum.skipped,  ic:"⊘", c:"#555"},
+                {l:"Monthly",      v:sum.monthly,  ic:"📅",c:BC.monthly},
+                {l:"Quarterly",    v:sum.quarterly,ic:"🗓",c:BC.quarterly},
+                {l:"Annual",       v:sum.annual,   ic:"📆",c:BC.annual},
+              ].filter(c=>c.v>0).map(c=>(
+                <div key={c.l} style={{flex:"1 1 88px",background:"#13162a",border:`1px solid ${c.c}44`,borderRadius:9,padding:"11px 12px",cursor:"pointer"}}
+                  onClick={()=>setFilter(["gap","catchup","clean","skipped"].includes(c.l.toLowerCase().split(" ")[0])?c.l.toLowerCase().split(" ")[0]:"all")}>
+                  <div style={{fontSize:16,marginBottom:2}}>{c.ic}</div>
+                  <div style={{fontSize:20,fontWeight:700,color:c.c}}>{c.v}</div>
+                  <div style={{fontSize:9,color:"#6c7aa0"}}>{c.l}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Key */}
+            <div style={{background:"#0d1219",border:"1px solid #2a2d3e",borderRadius:8,padding:"8px 14px",marginBottom:10,fontSize:11,display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
+              <b style={{color:"#5a6a8a",fontSize:10}}>KEY:</b>
+              <span><span style={{background:"#FFFF00",color:"#000",padding:"2px 8px",borderRadius:3,fontWeight:700}}>YELLOW</span>&nbsp;= Missing billing — check if accrual needed</span>
+              <span><span style={{background:"#FFA500",color:"#000",padding:"2px 8px",borderRadius:3,fontWeight:700}}>ORANGE</span>&nbsp;= Covered by catch-up or sibling PO</span>
+              <span style={{color:"#3a5a7a",fontSize:10,marginLeft:"auto"}}>Flagging from {FLAG_START_LABEL} · Current month: <b style={{color:"#4fc3f7"}}>{CURRENT_MONTH}</b></span>
+            </div>
+
+            {/* Billing key */}
+            <div style={{background:"#0d1219",border:"1px solid #2a2d3e",borderRadius:8,padding:"6px 14px",marginBottom:10,fontSize:10,display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+              <b style={{color:"#5a6a8a"}}>BILLING:</b>
+              {[{t:"monthly",l:"MONTHLY"},{t:"quarterly",l:"QUARTERLY"},{t:"annual",l:"ANNUAL — 1-2 payments (blanks not flagged)"}].map(b=>(
+                <span key={b.t} style={{background:BC[b.t]+"22",border:`1px solid ${BC[b.t]}44`,borderRadius:10,padding:"2px 9px",color:BC[b.t]}}>{b.l}</span>
+              ))}
+            </div>
+
+            {/* Filters */}
+            <div style={{display:"flex",gap:7,marginBottom:11,flexWrap:"wrap",alignItems:"center"}}>
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search eGBS or PO number…"
+                style={{background:"#1a1d2e",border:"1px solid #2a3560",borderRadius:7,color:"#e8e8e8",padding:"7px 12px",fontSize:12,outline:"none",width:240,fontFamily:M}}/>
+              {[
+                {k:"all",    l:"All POs"},
+                {k:"flagged",l:"⚠ Flagged"},
+                {k:"gap",    l:"🟡 True Gaps"},
+                {k:"catchup",l:"🟠 Covered"},
+                {k:"clean",  l:"✓ Clean"},
+                {k:"skipped",l:"⊘ Skipped"},
+              ].map(f=>(
+                <button key={f.k} onClick={()=>setFilter(f.k)}
+                  style={btn(filter===f.k?"#1565c0":"#13162a",filter===f.k?"#4fc3f7":"#2a3560",filter===f.k?"#fff":"#6c7aa0",filter===f.k?700:400)}>
+                  {f.l}
+                </button>
+              ))}
+              <span style={{marginLeft:"auto",fontSize:11,color:"#4a5580"}}>{shown.length}/{allRows.length} POs</span>
+            </div>
+
+            {/* Results list */}
+            {shown.length===0
+              ?<div style={{textAlign:"center",color:"#4a5580",padding:36,fontSize:13}}>No results match.</div>
+              :shown.map(r=>{
+                const key=`${r.egbs}:${r.po}`;
+                const open=expanded[key];
+                const bc=BC[r.billing.type]||"#555";
+                const hasGap=Object.values(r.flagged).some(f=>f.status==="gap");
+                const hasCU=Object.values(r.flagged).some(f=>f.status==="catchup");
+                const isStandalone=r.egbs==="(standalone)";
+                return(
+                  <div key={key} style={{marginBottom:4,background:"#13162a",border:`1px solid ${r.hasFlag?"#3a2a00":r.skipReason?"#1a1a22":"#1a1e2e"}`,borderRadius:8,overflow:"hidden"}}>
+                    <div onClick={()=>setExpanded(p=>({...p,[key]:!p[key]}))}
+                      style={{display:"flex",alignItems:"center",gap:10,padding:"8px 12px",cursor:"pointer",background:r.hasFlag?"#1e1800":r.skipReason?"#111":"#141828",flexWrap:"wrap"}}>
+                      <span style={{color:isStandalone?"#5a6a8a":"#4fc3f7",fontWeight:700,minWidth:130,fontSize:11,flexShrink:0}}>{r.egbs}</span>
+                      <span style={{color:r.skipReason?"#444":"#7788aa",fontSize:11,minWidth:158,flexShrink:0}}>{r.po}</span>
+                      <span style={{background:bc+"22",border:`1px solid ${bc}44`,borderRadius:10,padding:"1px 8px",fontSize:9,color:bc,flexShrink:0,textTransform:"uppercase"}}>{r.billing.type}</span>
+                      {r.isMain&&!isStandalone&&<span style={{background:"#4fc3f722",border:"1px solid #4fc3f744",borderRadius:10,padding:"1px 7px",fontSize:9,color:"#4fc3f7",flexShrink:0}}>★ MAIN</span>}
+                      {r.skipReason
+                        ?<span style={{color:"#444",fontSize:10}}>⊘ Skipped</span>
+                        :<div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+                          {hasGap&&<span style={{background:"#FFD70022",border:"1px solid #FFD70066",borderRadius:4,padding:"1px 7px",fontSize:10,color:"#FFD700",fontWeight:700}}>⚠ GAP</span>}
+                          {hasCU&&<span style={{background:"#FF8C0022",border:"1px solid #FF8C0066",borderRadius:4,padding:"1px 7px",fontSize:10,color:"#FF8C00",fontWeight:700}}>↑ COVERED</span>}
+                          {!r.hasFlag&&<span style={{color:"#4CAF5099",fontSize:10}}>✓ No issues</span>}
+                          {Object.entries(r.flagged).map(([gi,fl])=>(
+                            <span key={gi} style={{background:FS[fl.status]?.bg+"aa",color:FS[fl.status]?.text,borderRadius:4,padding:"1px 6px",fontSize:9,fontWeight:700}}>{r.monthKeys[gi]}</span>
+                          ))}
+                        </div>
+                      }
+                      <span style={{marginLeft:"auto",color:"#4a5580",fontSize:12,flexShrink:0}}>{open?"▲":"▼"}</span>
+                    </div>
+
+                    {open&&(
+                      <div style={{padding:"10px 12px",overflowX:"auto",background:"#0f1117"}}>
+                        <div style={{display:"flex",gap:3,minWidth:"max-content",marginBottom:8}}>
+                          {r.monthKeys.map((mk,i)=>{
+                            const amt=r.amounts[i];
+                            const flag=r.flagged[i];
+                            const isCur=mk===CURRENT_MONTH;
+                            const invDts=r.invMonths[mk]||[];
+                            const bg=flag?FS[flag.status]?.bg:(amt>0?(isCur?"#1a4a2a":"#1a3560"):(isCur?"#181f18":"#13162a"));
+                            const tx=flag?FS[flag.status]?.text:(amt>0?(isCur?"#88ffaa":"#aaccee"):"#2a3a5a");
+                            return(
+                              <div key={mk} style={{minWidth:62,textAlign:"center"}} title={flag?.note||(invDts.length?`Inv: ${invDts.join(", ")}`:"")}>
+                                <div style={{fontSize:8,color:isCur?"#88ff88":"#3a4a6a",marginBottom:2,fontWeight:isCur?700:400}}>{mk}{isCur?" ★":""}</div>
+                                <div style={{background:bg,color:tx,borderRadius:4,padding:"4px 2px",fontSize:10,fontWeight:amt>0?600:400,border:flag?`2px solid ${FS[flag.status]?.border}`:(isCur?"1px solid #336633":"1px solid #1e2a3a"),minHeight:26,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column",gap:1}}>
+                                  {amt>0?fmtS(amt):"—"}
+                                  {!flag&&invDts.length>0&&<div style={{fontSize:7,color:isCur?"#4a9a6a":"#4a7ab0",lineHeight:1}}>📄{invDts.length}</div>}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        {Object.entries(r.flagged).map(([gi,fl])=>(
+                          <div key={gi} style={{display:"flex",gap:8,alignItems:"flex-start",marginBottom:3,padding:"5px 9px",background:FS[fl.status]?.bg+"18",borderLeft:`3px solid ${FS[fl.status]?.bg}`,borderRadius:3}}>
+                            <span style={{fontWeight:700,color:FS[fl.status]?.bg,minWidth:50,fontSize:10,flexShrink:0}}>{r.monthKeys[gi]}</span>
+                            <span style={{fontSize:10,color:"#aabbcc",lineHeight:1.5}}>{fl.note}</span>
+                          </div>
+                        ))}
+                        {r.skipReason&&<div style={{color:"#44444499",fontSize:10,padding:"4px 0"}}>⊘ {r.skipReason}</div>}
+                        {!r.hasFlag&&!r.skipReason&&<div style={{color:"#4CAF5066",fontSize:10,padding:"4px 0"}}>✓ All months accounted for — no gaps detected.</div>}
+                        <div style={{marginTop:6,fontSize:9,color:"#3a4a5a",display:"flex",gap:16,flexWrap:"wrap"}}>
+                          {r.typ>0&&<span>Base rate: <b style={{color:"#4466aa"}}>{fmt(r.typ)}</b>/mo</span>}
+                          <span>Billing: <b style={{color:bc}}>{r.billing.type}</b>{r.billing.gap>0?` (~${r.billing.gap}mo)`:""}</span>
+                          {isStandalone&&<span style={{color:"#445566"}}>standalone (no siblings)</span>}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            }
+            <div style={{marginTop:12,color:"#2a3a4a",fontSize:10,textAlign:"right"}}>
+              {fileName} · {parsed?.records?.length} POs loaded · {sum.flagged} flagged · {sum.clean} clean · {sum.skipped} skipped
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
