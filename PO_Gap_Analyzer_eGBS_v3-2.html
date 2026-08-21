@@ -1,0 +1,773 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>PO Gap Analyzer — eGBS v3</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.3.0/exceljs.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:#0f1117;color:#e8e8e8;font-family:'JetBrains Mono','Courier New',monospace;}
+::-webkit-scrollbar{width:5px;height:5px;}
+::-webkit-scrollbar-track{background:#1a1d2e;}
+::-webkit-scrollbar-thumb{background:#2a3560;border-radius:3px;}
+select{background:#1a1d2e;border:1px solid #2a3560;color:#e8e8e8;padding:5px 8px;border-radius:6px;font-family:inherit;font-size:11px;cursor:pointer;outline:none;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useCallback,useMemo}=React;
+const MON=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+// Dynamic month range: Jan of (currentYear-1) to current month
+function buildMonthRange(){
+  const now=new Date(),cy=now.getFullYear(),cm=now.getMonth()+1,sy=cy-1;
+  const r=[];let y=sy,m=1;
+  while(y<cy||(y===cy&&m<=cm)){r.push(`${MON[m-1]}-${String(y).slice(2)}`);m++;if(m>12){m=1;y++;}}
+  return r;
+}
+const ALL_MONTHS=buildMonthRange();
+const CUR_MON=(()=>{const n=new Date();return `${MON[n.getMonth()]}-${String(n.getFullYear()).slice(2)}`;})();
+const FLAG_START=`Jul-${String(new Date().getFullYear()-1).slice(2)}`;
+
+// Parsers
+function parseAP(val){
+  if(val==null||val==="")return null;
+  if(typeof val==="number"&&val>10000){
+    const d=XLSX.SSF.parse_date_code(val);if(!d)return null;
+    return `${MON[d.m-1]}-${String(d.y).slice(2)}`;
+  }
+  const s=String(val).trim();
+  let m=s.match(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s\-\/](\d{2,4})$/i);
+  if(m){let yr=m[2];if(yr.length===4)yr=yr.slice(2);return `${m[1][0].toUpperCase()+m[1].slice(1).toLowerCase()}-${yr}`;}
+  m=s.match(/^(\d{1,2})[\/\-](\d{4})$/)||s.match(/^(\d{4})[\/\-](\d{2})$/);
+  if(m){let mn=parseInt(m[1]),yr=m[2];if(mn>12){mn=parseInt(m[2]);yr=m[1];}if(mn<1||mn>12)return null;return `${MON[mn-1]}-${String(yr).slice(-2)}`;}
+  return null;
+}
+function parseAmt(v){
+  if(v==null||v==="")return 0;
+  if(typeof v==="number")return v;
+  return parseFloat(String(v).replace(/[,$()]/g,""))||0;
+}
+
+// Auto-detect columns
+function autoDetect(headers){
+  const h=headers.map(x=>String(x??"").toLowerCase().trim());
+  const find=(...kws)=>{for(const kw of kws){const i=h.findIndex(x=>x.includes(kw));if(i>=0)return headers[i];}return null;};
+  return{
+    eGBSCol:find("parent egbs","parent_egbs","parentegbs","egbs parent","egbs"),
+    poCol:find("purchase order no","purchase order","po number","po no","po#"),
+    apCol:find("activity period","actperiod","period","activity_period"),
+    amtCol:find("amt","amount","sum of amt","total amt"),
+  };
+}
+
+// Build pivot — use most-frequent eGBS per PO
+function buildPivot(ws,cm){
+  const raw=XLSX.utils.sheet_to_json(ws,{defval:null,raw:true});
+  if(!raw.length)return null;
+  const{eGBSCol,poCol,apCol,amtCol}=cm;
+  if(!poCol||!apCol||!amtCol)return null;
+
+  // Pass 1: find dominant eGBS per PO
+  const poCounts={};
+  raw.forEach(row=>{
+    const po=String(row[poCol]??"").trim();if(!po)return;
+    const eg=eGBSCol?String(row[eGBSCol]??"").trim():"";
+    if(!poCounts[po])poCounts[po]={};
+    const key=eg||"__NONE__";
+    poCounts[po][key]=(poCounts[po][key]||0)+1;
+  });
+  const poEg={};
+  Object.entries(poCounts).forEach(([po,counts])=>{
+    const top=Object.entries(counts).sort(([,a],[,b])=>b-a)[0][0];
+    poEg[po]=top==="__NONE__"?`__SOLO__${po}`:top;
+  });
+
+  // Pass 2: build pivot grouped by eGBS
+  const pivot={};const mUsed=new Set();
+  raw.forEach(row=>{
+    const po=String(row[poCol]??"").trim();if(!po)return;
+    const mk=parseAP(row[apCol]);const amt=parseAmt(row[amtCol]);
+    if(!mk||!ALL_MONTHS.includes(mk))return;
+    mUsed.add(mk);
+    const egKey=poEg[po]||`__SOLO__${po}`;
+    if(!pivot[egKey])pivot[egKey]={};
+    if(!pivot[egKey][po])pivot[egKey][po]={};
+    pivot[egKey][po][mk]=(pivot[egKey][po][mk]||0)+amt;
+  });
+
+  const monthKeys=ALL_MONTHS.filter(m=>mUsed.has(m));
+  const mKeys=monthKeys.length>=2?monthKeys:ALL_MONTHS;
+  const records=[];
+  Object.entries(pivot).forEach(([egKey,pos])=>{
+    const label=egKey.startsWith("__SOLO__")?"(standalone)":egKey;
+    Object.entries(pos).forEach(([po,mdata])=>{
+      const months={};
+      mKeys.forEach(mk=>{months[mk]=mdata[mk]||0;});
+      records.push({egbs:label,egKey,po,months});
+    });
+  });
+  return{records,monthKeys:mKeys};
+}
+
+// Math
+function medOf(arr){
+  if(!arr.length)return 0;
+  const s=[...arr].sort((a,b)=>a-b),m=Math.floor(s.length/2);
+  return s.length%2?s[m]:(s[m-1]+s[m])/2;
+}
+
+// Base rate: trimmed average of lower 75% of non-zero values
+// Removes top 25% (catch-up months) before averaging → accurate single-month rate
+function baseRate(arr){
+  const nz=[...arr.filter(x=>x>0)].sort((a,b)=>a-b);
+  if(!nz.length)return 0;
+  if(nz.length===1)return nz[0];
+  const cut=Math.ceil(nz.length*0.75);
+  const trimmed=nz.slice(0,cut);
+  return trimmed.reduce((s,v)=>s+v,0)/trimmed.length;
+}
+
+function near(v,t,p){return t>0&&Math.abs(v-t)<=p*t;}
+function fmt(n){return n?new Intl.NumberFormat("en-US",{style:"currency",currency:"USD",maximumFractionDigits:0}).format(n):"-";}
+function fmtS(n){
+  if(!n)return"—";
+  if(Math.abs(n)>=1e6)return"$"+(n/1e6).toFixed(1)+"M";
+  if(Math.abs(n)>=1000)return"$"+(n/1000).toFixed(0)+"k";
+  return"$"+Math.round(n);
+}
+
+// Billing type: if any two consecutive months have billing → monthly
+function detectBilling(amounts){
+  const idx=amounts.map((v,i)=>v>0?i:-1).filter(i=>i>=0);
+  if(idx.length<=1)return{type:"annual",gap:12};
+  const gaps=[];for(let i=1;i<idx.length;i++)gaps.push(idx[i]-idx[i-1]);
+  const minG=Math.min(...gaps),med=medOf(gaps);
+  if(minG<=1)return{type:"monthly",gap:1};
+  if(med>=9||idx.length<=2)return{type:"annual",gap:Math.round(med)||12};
+  if(med>=2.5)return{type:"quarterly",gap:Math.round(med)};
+  return{type:"monthly",gap:1};
+}
+
+// Independent PO detection
+// Two POs billing in the same month ≥2 times = own runrate = NOT siblings
+function countOverlap(mA,mB,monthKeys){
+  let ov=0;
+  for(const mk of monthKeys){if((mA[mk]||0)>0&&(mB[mk]||0)>0){ov++;if(ov>=2)return ov;}}
+  return ov;
+}
+
+// Gap candidates
+function gapCands(amounts,billing,first,last,isMain,sibTakeover,flagIdx,curIdx){
+  const{type,gap}=billing;
+  const c=new Set();
+  const lastIdx=amounts.length-1;
+  const flagEnd=curIdx>=0?Math.min(curIdx,lastIdx):lastIdx;
+
+  if(type==="annual"){
+    const next=last+gap;
+    if(next<=flagEnd&&next>=flagIdx&&amounts[next]===0)c.add(next);
+    return c;
+  }
+  if(type==="quarterly"){
+    let pos=first;
+    while(pos+gap<=flagEnd){
+      pos+=gap;
+      const win=[pos-1,pos,pos+1].filter(x=>x>=0&&x<amounts.length);
+      if(pos>=flagIdx&&!win.some(x=>amounts[x]>0))c.add(pos);
+    }
+    return c;
+  }
+  // Monthly: every zero in active range from flagIdx
+  for(let i=Math.max(first,flagIdx);i<=last;i++){if(amounts[i]===0)c.add(i);}
+  // Trailing
+  if(isMain){
+    const trailEnd=sibTakeover!=null?Math.min(flagEnd,sibTakeover-1):flagEnd;
+    for(let gi=Math.max(last+1,flagIdx);gi<=trailEnd;gi++)c.add(gi);
+  } else {
+    for(let gi=Math.max(last+1,flagIdx);gi<=flagEnd;gi++){
+      const ws=Math.max(0,gi-4);
+      if(amounts.slice(ws,gi).filter(x=>x>0).length>=2)c.add(gi);else break;
+    }
+  }
+  return c;
+}
+
+function toRuns(sorted){
+  if(!sorted.length)return[];
+  const runs=[[sorted[0]]];
+  for(let i=1;i<sorted.length;i++){
+    sorted[i]===sorted[i-1]+1?runs[runs.length-1].push(sorted[i]):runs.push([sorted[i]]);
+  }
+  return runs;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RESOLVE GAPS — three-pass approach
+//
+// PASS A (run-based, consolidated payments):
+//   For each consecutive run of N gaps:
+//   A1. Cross-eGBS: sibling has ≈N×typ (±35%) in [lastGi .. lastGi+lookahead]
+//       NO usedSib tracking — allows same sibling payment to be detected
+//       by each run independently. checkN starts at N (no partial coverage).
+//   A2. Same-PO: has ≈N×typ (±25%) in [lastGi+1 .. lastGi+lookahead]
+//
+// PASS B (individual per-gap, distributed payments):
+//   For each still-uncovered gap gi:
+//   Check if ANY sibling has billing ≥ typ×0.7 in [gi .. gi+3]
+//   Catches: sibling PO pays each month normally (1×typ each month)
+//   Example fix: eGBS 30458 Oct/Nov/Dec each covered 1:1 by sibling
+//
+// PASS C: remaining uncovered = true gap (yellow)
+//
+// Key design decisions:
+//   - No usedSib in Pass A → sibling payment for [Sep,Oct] is found even
+//     if a prior iteration might have consumed it (fixes eGBS 102453)
+//   - checkN starts at N in Pass A → no partial coverage (fixes eGBS 1073)
+//   - Pass B forward-only [gi..gi+3] → Aug-26 on old PO stays yellow
+//     when billing switched to sibling (fixes eGBS 172256)
+//   - indepPairs filters sibs → eGBS 227671 POs not cross-checked
+// ═══════════════════════════════════════════════════════════════
+function resolveGaps(gapSet,amounts,monthKeys,typ,sibs,lookahead){
+  const gaps=[...gapSet].sort((a,b)=>a-b);
+  if(!gaps.length)return{};
+  const flagged={},covered=new Set();
+
+  // PASS A — consolidated run checks
+  toRuns(gaps).forEach(run=>{
+    const N=run.length,lastGi=run[N-1];
+    let done=false;
+
+    // A1: Cross-eGBS — sibling has N×typ in same or future month
+    for(let d=0;d<=lookahead&&!done;d++){
+      const ti=lastGi+d;if(ti>=amounts.length)break;
+      for(const sib of sibs){
+        if(done)break;
+        const sa=sib.months[monthKeys[ti]]||0;if(sa<=0)continue;
+        for(let cn=N;cn<=N+4;cn++){
+          if(near(sa,cn*typ,0.35)){
+            const note=`${cn}-month billing in ${sib.po} (${fmt(sa)}) at ${monthKeys[ti]} — cross-eGBS`;
+            run.forEach(g=>{flagged[g]={s:"c",note};covered.add(g);});
+            done=true;break;
+          }
+        }
+      }
+    }
+    if(done)return;
+
+    // A2: Same-PO — has N×typ in future month
+    for(let a=1;a<=lookahead&&!done;a++){
+      const ti=lastGi+a;if(ti>=amounts.length)break;
+      const fa=amounts[ti];if(fa<=0)continue;
+      for(let cn=N;cn<=N+4;cn++){
+        if(near(fa,cn*typ,0.25)){
+          const note=`${cn}-month billing on same PO at ${monthKeys[ti]} (${fmt(fa)}) — covers ${cn-1} missed month(s)`;
+          run.forEach(g=>{flagged[g]={s:"c",note};covered.add(g);});
+          done=true;break;
+        }
+      }
+      if(done)break;
+    }
+  });
+
+  // PASS B — individual per-gap: sibling has billing ≥ 0.7×typ in [gi..gi+3]
+  // Handles distributed monthly sibling payments (1×typ each month separately)
+  gaps.filter(gi=>!covered.has(gi)).forEach(gi=>{
+    for(let d=0;d<=3;d++){
+      const ti=gi+d;if(ti>=amounts.length)break;
+      for(const sib of sibs){
+        const sa=sib.months[monthKeys[ti]]||0;
+        if(sa>=typ*0.7){
+          covered.add(gi);
+          flagged[gi]={s:"c",note:`Covered by ${sib.po} (${fmt(sa)}) at ${monthKeys[ti]}`};
+          return;
+        }
+      }
+    }
+  });
+
+  // PASS C — true gaps (yellow)
+  gaps.filter(gi=>!covered.has(gi)).forEach(gi=>{
+    const nzIdx=amounts.map((v,i)=>v>0?i:-1).filter(i=>i>=0);
+    const lastNz=nzIdx.length?nzIdx[nzIdx.length-1]:-1;
+    flagged[gi]={
+      s:"g",
+      note:gi>lastNz
+        ?`${monthKeys[gi]} missing — PO was active in prior months, expected ~${fmt(typ)}/month`
+        :`Missing ~${fmt(typ)}/month. No coverage found on this or sibling POs.`
+    };
+  });
+  return flagged;
+}
+
+// Main analysis
+function analyze(records,monthKeys){
+  const byEg={};
+  records.forEach(r=>{if(!byEg[r.egKey])byEg[r.egKey]=[];byEg[r.egKey].push(r);});
+  const all=[];
+
+  Object.entries(byEg).forEach(([egKey,pos])=>{
+    // eGBS-level billing: if any PO is monthly → all monthly
+    const billings=pos.map(po=>detectBilling(monthKeys.map(mk=>po.months[mk]||0)));
+    const egType=billings.some(b=>b.type==="monthly")?"monthly":billings.some(b=>b.type==="quarterly")?"quarterly":"annual";
+    const egGap=egType==="monthly"?1:billings.find(b=>b.type===egType)?.gap||3;
+    const billing={type:egType,gap:egGap};
+
+    // Independent PO pairs: concurrent billing in ≥2 months = own runrate
+    const indepPairs=new Set();
+    for(let i=0;i<pos.length;i++){
+      for(let j=i+1;j<pos.length;j++){
+        if(countOverlap(pos[i].months,pos[j].months,monthKeys)>=2){
+          indepPairs.add(`${pos[i].po}||${pos[j].po}`);
+          indepPairs.add(`${pos[j].po}||${pos[i].po}`);
+        }
+      }
+    }
+
+    // Main PO: most billing months (≥3 required)
+    const nzCounts=pos.map(po=>monthKeys.filter(mk=>(po.months[mk]||0)>0).length);
+    const maxNz=Math.max(...nzCounts);
+    const mainIdx=maxNz>=3
+      ?nzCounts.reduce((bi,cnt,i)=>{
+          if(cnt<maxNz)return bi;
+          const lA=monthKeys.map((mk,mi)=>(pos[i].months[mk]||0)>0?mi:-1).filter(x=>x>=0).slice(-1)[0]??-1;
+          const lB=monthKeys.map((mk,mi)=>(pos[bi].months[mk]||0)>0?mi:-1).filter(x=>x>=0).slice(-1)[0]??-1;
+          return lA>=lB?i:bi;
+        },0)
+      :0;
+
+    const flagIdx=Math.max(0,monthKeys.indexOf(FLAG_START));
+    const curIdx=monthKeys.indexOf(CUR_MON);
+
+    pos.forEach((po,pi)=>{
+      const amounts=monthKeys.map(mk=>po.months[mk]||0);
+      const nzIdx=amounts.map((v,i)=>v>0?i:-1).filter(i=>i>=0);
+      const isMain=pi===mainIdx;
+      const isIndep=[...indepPairs].some(k=>k.startsWith(`${po.po}||`));
+
+      if(!nzIdx.length){
+        all.push({egbs:po.egbs,po:po.po,amounts,flagged:{},monthKeys,typ:0,hasFlag:false,skipReason:"No billing data",isIndep});
+        return;
+      }
+      if(nzIdx.length<=3){
+        all.push({egbs:po.egbs,po:po.po,amounts,flagged:{},monthKeys,typ:0,hasFlag:false,skipReason:"≤3 billing months",isIndep});
+        return;
+      }
+
+      const first=nzIdx[0],last=nzIdx[nzIdx.length-1];
+
+      // Base rate from FLAG window (Jul-25+); fallback to all amounts
+      // Using trimmed average (lower 75%) to exclude catch-up months
+      const winAmts=amounts.filter((_,i)=>{
+        const mi=ALL_MONTHS.indexOf(monthKeys[i]);
+        return mi>=ALL_MONTHS.indexOf(FLAG_START)&&amounts[i]>0;
+      });
+      const typ=winAmts.length>=3?baseRate(winAmts):baseRate(amounts.filter(x=>x>0));
+
+      if(typ===0){
+        all.push({egbs:po.egbs,po:po.po,amounts,flagged:{},monthKeys,typ:0,hasFlag:false,skipReason:"Zero amount",isIndep});
+        return;
+      }
+
+      // Sibling list: all non-independent POs in this eGBS group
+      const sibs=pos.filter((p,i)=>i!==pi&&!indepPairs.has(`${po.po}||${p.po}`))
+        .map(p=>({po:p.po,months:monthKeys.reduce((o,mk)=>{o[mk]=p.months[mk]||0;return o;},{})}));
+
+      // Sibling takeover: first month after main PO's last billing where
+      // a non-independent sibling has regular billing (~1×typ ±60%)
+      let sibTakeover=null;
+      if(isMain&&sibs.length>0){
+        const endSearch=curIdx>=0?Math.min(curIdx,amounts.length-1):amounts.length-1;
+        for(let i=last+1;i<=endSearch;i++){
+          if(sibs.some(s=>near(s.months[monthKeys[i]]||0,typ,0.60))){
+            sibTakeover=i;break;
+          }
+        }
+      }
+
+      const lookahead=billing.type==="quarterly"?billing.gap+1:3;
+      const cands=gapCands(amounts,billing,first,last,isMain,sibTakeover,flagIdx,curIdx);
+      let flagged={};
+      if(cands.size>0)flagged=resolveGaps(cands,amounts,monthKeys,typ,sibs,lookahead);
+
+      all.push({
+        egbs:po.egbs,po:po.po,amounts,flagged,monthKeys,typ,
+        hasFlag:Object.values(flagged).some(f=>f.s==="g"),
+        skipReason:null,isMain,isIndep
+      });
+    });
+  });
+  return all;
+}
+
+// Excel export — white cells, only yellow for true gaps
+async function exportExcel(allRows,monthKeys,fileName){
+  const wb=new ExcelJS.Workbook();
+  const ws=wb.addWorksheet("PO Gap Report");
+  const bdr=c=>{const e={style:"thin",color:{argb:"FFCCCCCC"}};c.border={top:e,left:e,bottom:e,right:e};};
+  const W={type:"pattern",pattern:"solid",fgColor:{argb:"FFFFFFFF"}};
+  const Y={type:"pattern",pattern:"solid",fgColor:{argb:"FFFFFF00"}};
+
+  // Header
+  const hdr=ws.addRow(["Parent eGBS","PO Number",...monthKeys,"Issues"]);
+  hdr.height=22;
+  hdr.eachCell(c=>{
+    c.fill={type:"pattern",pattern:"solid",fgColor:{argb:"FF1F3864"}};
+    c.font={color:{argb:"FFFFFFFF"},bold:true,size:10,name:"Calibri"};
+    c.alignment={vertical:"middle",horizontal:"center",wrapText:true};
+    bdr(c);
+  });
+  hdr.getCell(1).alignment={vertical:"middle",horizontal:"left"};
+  hdr.getCell(2).alignment={vertical:"middle",horizontal:"left"};
+  ws.getColumn(1).width=20;ws.getColumn(2).width=22;
+  monthKeys.forEach((_,i)=>{ws.getColumn(i+3).width=10;});
+  ws.getColumn(monthKeys.length+3).width=55;
+  ws.views=[{state:"frozen",xSplit:2,ySplit:1,activeCell:"C2"}];
+
+  allRows.forEach(r=>{
+    const issues=Object.entries(r.flagged).filter(([,f])=>f.s==="g")
+      .map(([gi,f])=>`[${r.monthKeys[gi]}] ${f.note}`).join(" | ");
+    const row=ws.addRow([r.egbs,r.po,...r.amounts,issues||(r.skipReason?"Skipped: "+r.skipReason:"No issues")]);
+    row.height=16;
+    row.getCell(1).fill=W;row.getCell(1).font={bold:true,size:10,name:"Calibri"};bdr(row.getCell(1));
+    row.getCell(2).fill=W;row.getCell(2).font={size:10,name:"Calibri"};bdr(row.getCell(2));
+    r.amounts.forEach((amt,i)=>{
+      const cell=row.getCell(i+3);
+      const isGap=r.flagged[i]?.s==="g";
+      cell.fill=isGap?Y:W;
+      cell.font={bold:isGap,size:10,name:"Calibri",color:{argb:"FF000000"}};
+      cell.numFmt="#,##0";
+      cell.alignment={horizontal:"right",vertical:"middle"};
+      cell.value=amt>0?amt:"";
+      bdr(cell);
+    });
+    const sc=row.getCell(monthKeys.length+3);
+    sc.value=issues||(r.skipReason?"Skipped: "+r.skipReason:"No issues");
+    sc.fill=W;sc.alignment={wrapText:true,vertical:"top"};
+    sc.font={size:9,name:"Calibri",color:{argb:issues?"FFCC6600":"FF008800"}};
+    bdr(sc);
+  });
+
+  const buf=await wb.xlsx.writeBuffer();
+  const blob=new Blob([buf],{type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download=(fileName||"Report").replace(/\.xlsx$/i,"")+`_GAP_${CUR_MON.replace("-","")}.xlsx`;
+  a.click();URL.revokeObjectURL(url);
+}
+
+const M="'JetBrains Mono','Courier New',monospace";
+const btn=(bg,bd,col,fw)=>({background:bg,border:`1px solid ${bd}`,borderRadius:7,color:col,padding:"7px 12px",fontSize:11,cursor:"pointer",fontFamily:M,fontWeight:fw||400});
+
+function ColMap({headers,cm,onChange}){
+  const fields=[
+    {key:"eGBSCol",label:"Parent eGBS *"},
+    {key:"poCol",label:"Purchase Order *"},
+    {key:"apCol",label:"Activity Period *"},
+    {key:"amtCol",label:"Amount *"},
+  ];
+  return(
+    <div style={{background:"#0d1219",border:"1px solid #2a3560",borderRadius:10,padding:16,marginBottom:16}}>
+      <div style={{fontSize:12,color:"#4fc3f7",fontWeight:700,marginBottom:12}}>Column Mapping (* required)</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:10}}>
+        {fields.map(f=>(
+          <div key={f.key} style={{display:"flex",flexDirection:"column",gap:4}}>
+            <label style={{fontSize:10,color:"#9fa8da"}}>{f.label}</label>
+            <select value={cm[f.key]||""} onChange={e=>onChange({...cm,[f.key]:e.target.value||null})}>
+              <option value="">-- select --</option>
+              {headers.map(h=><option key={h} value={h}>{h}</option>)}
+            </select>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function App(){
+  const [stage,setStage]=useState("upload");
+  const [rawWb,setRawWb]=useState(null);
+  const [rawSheet,setRawSheet]=useState(null);
+  const [sName,setSName]=useState("");
+  const [sNames,setSNames]=useState([]);
+  const [headers,setHeaders]=useState([]);
+  const [cm,setCm]=useState({});
+  const [parsed,setParsed]=useState(null);
+  const [rows,setRows]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [error,setError]=useState("");
+  const [filter,setFilter]=useState("all");
+  const [search,setSearch]=useState("");
+  const [exp,setExp]=useState({});
+  const [fileName,setFileName]=useState("");
+  const [exporting,setExporting]=useState(false);
+
+  const loadSheet=useCallback((wb,name)=>{
+    try{
+      const ws=wb.Sheets[name];
+      const raw=XLSX.utils.sheet_to_json(ws,{defval:null,header:1,raw:true});
+      let hi=0;for(let i=0;i<Math.min(10,raw.length);i++){if(raw[i].filter(v=>v!=null&&v!=="").length>3){hi=i;break;}}
+      const hdrs=raw[hi].map((v,i)=>v!=null&&String(v).trim()?String(v).trim():`Col${i+1}`);
+      setHeaders(hdrs);setRawSheet(ws);setSName(name);setCm(autoDetect(hdrs));setStage("mapping");
+    }catch(e){setError("Sheet error: "+e.message);}
+    finally{setLoading(false);}
+  },[]);
+
+  const handleFile=useCallback(async file=>{
+    if(!file)return;
+    setLoading(true);setError("");setFileName(file.name);
+    setStage("upload");setRows([]);setParsed(null);setExp({});
+    try{
+      const buf=await file.arrayBuffer();
+      const wb=XLSX.read(buf,{type:"array",cellDates:false});
+      setRawWb(wb);setSNames(wb.SheetNames);
+      const best=wb.SheetNames.find(n=>/services|fdw|data|raw|detail/i.test(n))||wb.SheetNames[0];
+      loadSheet(wb,best);
+    }catch(e){setError("File error: "+e.message);setLoading(false);}
+  },[loadSheet]);
+
+  const onDrop=useCallback(e=>{e.preventDefault();const f=e.dataTransfer?.files?.[0];if(f)handleFile(f);},[handleFile]);
+
+  const run=useCallback(()=>{
+    if(!rawSheet)return;
+    setLoading(true);setError("");
+    try{
+      const p=buildPivot(rawSheet,cm);
+      if(!p||!p.records.length)throw new Error("Could not build pivot. Check column mapping.");
+      setParsed(p);setRows(analyze(p.records,p.monthKeys));setStage("results");
+    }catch(e){setError(e.message);}
+    finally{setLoading(false);}
+  },[rawSheet,cm]);
+
+  const doExport=async()=>{
+    if(!rows.length||!parsed)return;
+    setExporting(true);
+    try{await exportExcel(rows,parsed.monthKeys,fileName);}
+    catch(e){alert("Export error: "+e.message);}
+    finally{setExporting(false);}
+  };
+
+  const reset=()=>{setStage("upload");setRawWb(null);setRawSheet(null);setHeaders([]);setCm({});setParsed(null);setRows([]);setError("");setFileName("");setExp({});setFilter("all");setSearch("");};
+  const toggleAll=open=>{const m={};shown.forEach(r=>{m[`${r.egbs}:${r.po}`]=open;});setExp(m);};
+
+  const shown=useMemo(()=>rows.filter(r=>{
+    const mf=filter==="all"?true:filter==="gap"?r.hasFlag:filter==="clean"?(!r.hasFlag&&!r.skipReason):!!r.skipReason;
+    const ms=!search||r.egbs.toLowerCase().includes(search.toLowerCase())||r.po.toLowerCase().includes(search.toLowerCase());
+    return mf&&ms;
+  }),[rows,filter,search]);
+
+  const sum=useMemo(()=>{
+    let gaps=0,cov=0,clean=0,skip=0;
+    rows.forEach(r=>{
+      if(r.skipReason){skip++;return;}
+      Object.values(r.flagged).forEach(f=>f.s==="g"?gaps++:cov++);
+      if(!r.hasFlag)clean++;
+    });
+    return{total:rows.length,gaps,cov,clean,skip,flagged:rows.filter(r=>r.hasFlag).length};
+  },[rows]);
+
+  const canRun=!!(cm.eGBSCol&&cm.poCol&&cm.apCol&&cm.amtCol);
+
+  return(
+    <div style={{minHeight:"100vh",background:"#0f1117"}}>
+      <div style={{background:"linear-gradient(135deg,#1a1d2e,#0f1117)",borderBottom:"1px solid #2a2d3e",padding:"13px 18px",display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+        <div style={{width:30,height:30,background:"linear-gradient(135deg,#4fc3f7,#0288d1)",borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>📊</div>
+        <div>
+          <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>PO Gap Analyzer <span style={{fontSize:10,color:"#4fc3f7",border:"1px solid #4fc3f744",borderRadius:4,padding:"1px 5px"}}>eGBS v3</span></div>
+          <div style={{fontSize:9,color:"#6c7aa0"}}>FLAGS: {FLAG_START} → {CUR_MON} · PARENT eGBS GROUPING · INDEPENDENT PO DETECTION</div>
+        </div>
+        {stage==="results"&&(
+          <div style={{marginLeft:"auto",display:"flex",gap:7,flexWrap:"wrap"}}>
+            <button onClick={()=>toggleAll(true)} style={btn("#1a1d2e","#2a3560","#9fa8da")}>⊞ Expand All</button>
+            <button onClick={()=>toggleAll(false)} style={btn("#1a1d2e","#2a3560","#9fa8da")}>⊟ Collapse All</button>
+            <button onClick={doExport} disabled={exporting} style={btn(exporting?"#1a2a1a":"#1b5e20","#4caf50",exporting?"#555":"#fff",700)}>
+              {exporting?"⏳ Exporting…":"⬇ Export Excel"}
+            </button>
+            <button onClick={reset} style={btn("#1a1d2e","#2a3560","#9fa8da")}>↩ New File</button>
+          </div>
+        )}
+      </div>
+
+      <div style={{padding:"16px 18px"}}>
+
+        {stage==="upload"&&!loading&&(
+          <div onDrop={onDrop} onDragOver={e=>e.preventDefault()}
+            onClick={()=>document.getElementById("fi").click()}
+            style={{border:"2px dashed #2a3560",borderRadius:12,padding:"48px 36px",textAlign:"center",background:"#13162a",cursor:"pointer"}}>
+            <div style={{fontSize:38,marginBottom:10}}>📂</div>
+            <div style={{fontSize:14,fontWeight:600,color:"#c5cae9",marginBottom:6}}>Drop your RAW data Excel file here</div>
+            <div style={{fontSize:11,color:"#4a5580",marginBottom:4}}>Flagging: <b style={{color:"#FFD700"}}>{FLAG_START}</b> → <b style={{color:"#4fc3f7"}}>{CUR_MON}</b></div>
+            <div style={{fontSize:11,color:"#3a5570",marginBottom:18}}>Needs: Parent eGBS · Purchase Order · Activity Period · Amount</div>
+            <div style={{display:"inline-block",background:"linear-gradient(135deg,#1565c0,#0d47a1)",color:"#fff",padding:"8px 22px",borderRadius:7,fontSize:13,fontWeight:600}}>CHOOSE FILE</div>
+            <input id="fi" type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handleFile(e.target.files[0])}/>
+          </div>
+        )}
+
+        {loading&&<div style={{textAlign:"center",padding:44}}><div style={{fontSize:26,marginBottom:8}}>⚙️</div><div style={{color:"#4fc3f7",fontSize:13}}>Processing…</div></div>}
+        {error&&<div style={{background:"#1e0a0a",border:"1px solid #8b0000",borderRadius:9,padding:12,color:"#ff6b6b",fontSize:12,marginTop:12}}>⚠ {error}</div>}
+
+        {stage==="mapping"&&!loading&&(
+          <div>
+            <div style={{background:"#0d1219",border:"1px solid #2a2d3e",borderRadius:8,padding:"9px 13px",marginBottom:13,display:"flex",gap:14,flexWrap:"wrap",alignItems:"center"}}>
+              <span style={{fontSize:12,color:"#4fc3f7",fontWeight:700}}>📄 {fileName}</span>
+              {sNames.length>1&&(
+                <div style={{display:"flex",gap:6,alignItems:"center",flexWrap:"wrap"}}>
+                  <span style={{fontSize:10,color:"#4a5580"}}>Sheet:</span>
+                  {sNames.map(s=>(
+                    <button key={s} onClick={()=>{setLoading(true);loadSheet(rawWb,s);}}
+                      style={btn(s===sName?"#1565c0":"#13162a",s===sName?"#4fc3f7":"#2a3560",s===sName?"#fff":"#9fa8da")}>{s}</button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <ColMap headers={headers} cm={cm} onChange={setCm}/>
+            <div style={{display:"flex",gap:10}}>
+              <button onClick={run} disabled={!canRun}
+                style={btn(canRun?"linear-gradient(135deg,#1565c0,#0d47a1)":"#1a1d2e",canRun?"#4fc3f7":"#2a3560",canRun?"#fff":"#555",700)}>
+                {canRun?"▶ Run Analysis":"⚠ Map all required columns"}
+              </button>
+              <button onClick={reset} style={btn("#1a1d2e","#2a3560","#9fa8da")}>↩ Back</button>
+            </div>
+          </div>
+        )}
+
+        {stage==="results"&&(
+          <>
+            <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
+              {[
+                {l:"Total POs",v:sum.total,c:"#4fc3f7"},
+                {l:"True Gaps",v:sum.gaps,c:"#FFD700"},
+                {l:"Covered",v:sum.cov,c:"#8bc34a"},
+                {l:"Clean",v:sum.clean,c:"#4CAF50"},
+                {l:"Skipped",v:sum.skip,c:"#555"},
+              ].filter(x=>x.v>0).map(c=>(
+                <div key={c.l} style={{flex:"1 1 90px",background:"#13162a",border:`1px solid ${c.c}44`,borderRadius:9,padding:"10px 11px"}}>
+                  <div style={{fontSize:19,fontWeight:700,color:c.c}}>{c.v}</div>
+                  <div style={{fontSize:9,color:"#6c7aa0"}}>{c.l}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{background:"#0d1219",border:"1px solid #2a2d3e",borderRadius:8,padding:"7px 13px",marginBottom:10,fontSize:11,display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
+              <span><span style={{background:"#FFFF00",color:"#000",padding:"2px 7px",borderRadius:3,fontWeight:700}}>YELLOW</span> = Missing — check if accrual needed</span>
+              <span style={{color:"#3a5a7a",fontSize:10,marginLeft:"auto"}}>Data: {parsed?.monthKeys?.[0]} · Flags: {FLAG_START}→{CUR_MON}</span>
+            </div>
+
+            <div style={{display:"flex",gap:7,marginBottom:10,flexWrap:"wrap",alignItems:"center"}}>
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search eGBS or PO…"
+                style={{background:"#1a1d2e",border:"1px solid #2a3560",borderRadius:7,color:"#e8e8e8",padding:"6px 11px",fontSize:12,outline:"none",width:230,fontFamily:M}}/>
+              {[{k:"all",l:"All POs"},{k:"gap",l:"🟡 Gaps Only"},{k:"clean",l:"✓ Clean"},{k:"skip",l:"⊘ Skipped"}].map(f=>(
+                <button key={f.k} onClick={()=>setFilter(f.k)}
+                  style={btn(filter===f.k?"#1565c0":"#13162a",filter===f.k?"#4fc3f7":"#2a3560",filter===f.k?"#fff":"#6c7aa0",filter===f.k?700:400)}>
+                  {f.l}
+                </button>
+              ))}
+              <span style={{marginLeft:"auto",fontSize:11,color:"#4a5580"}}>{shown.length}/{rows.length} POs</span>
+            </div>
+
+            {shown.length===0
+              ?<div style={{textAlign:"center",color:"#4a5580",padding:32,fontSize:13}}>No results.</div>
+              :shown.map(r=>{
+                const key=`${r.egbs}:${r.po}`;
+                const open=exp[key];
+                const gapMs=Object.entries(r.flagged).filter(([,f])=>f.s==="g");
+                const covMs=Object.entries(r.flagged).filter(([,f])=>f.s==="c");
+                return(
+                  <div key={key} style={{marginBottom:3,background:"#13162a",border:`1px solid ${r.hasFlag?"#3a2a00":r.skipReason?"#1a1a22":"#1a1e2e"}`,borderRadius:7,overflow:"hidden"}}>
+                    <div onClick={()=>setExp(p=>({...p,[key]:!p[key]}))}
+                      style={{display:"flex",alignItems:"center",gap:9,padding:"7px 11px",cursor:"pointer",background:r.hasFlag?"#1e1800":r.skipReason?"#111":"#141828",flexWrap:"wrap"}}>
+                      <span style={{color:"#4fc3f7",fontWeight:700,minWidth:110,fontSize:11,flexShrink:0}}>{r.egbs}</span>
+                      <span style={{color:r.skipReason?"#444":"#7788aa",fontSize:11,minWidth:150,flexShrink:0}}>{r.po}</span>
+                      {r.isIndep&&<span style={{fontSize:9,color:"#5577aa",border:"1px solid #2a3560",borderRadius:10,padding:"1px 7px",flexShrink:0}}>own runrate</span>}
+                      {r.isMain&&!r.skipReason&&!r.isIndep&&<span style={{fontSize:9,color:"#4fc3f766",flexShrink:0}}>★ main</span>}
+                      {r.skipReason
+                        ?<span style={{color:"#444",fontSize:10}}>⊘ {r.skipReason}</span>
+                        :r.hasFlag
+                          ?<div style={{display:"flex",gap:3,flexWrap:"wrap"}}>
+                            {gapMs.map(([gi])=>(
+                              <span key={gi} style={{background:"#FFD700",color:"#000",borderRadius:4,padding:"1px 6px",fontSize:9,fontWeight:700}}>{r.monthKeys[gi]}</span>
+                            ))}
+                          </div>
+                          :<span style={{color:"#4CAF5099",fontSize:10}}>✓ No issues</span>
+                      }
+                      <span style={{marginLeft:"auto",color:"#4a5580",fontSize:11,flexShrink:0}}>{open?"▲":"▼"}</span>
+                    </div>
+
+                    {open&&(
+                      <div style={{padding:"9px 11px",overflowX:"auto",background:"#0f1117"}}>
+                        <div style={{display:"flex",gap:2,minWidth:"max-content",marginBottom:7}}>
+                          {r.monthKeys.map((mk,i)=>{
+                            const amt=r.amounts[i];
+                            const isGap=r.flagged[i]?.s==="g";
+                            const isCur=mk===CUR_MON;
+                            const bg=isGap?"#FFD700":(amt>0?"#1a3560":"#13162a");
+                            const tx=isGap?"#000":(amt>0?"#aaccee":"#2a3a5a");
+                            return(
+                              <div key={mk} style={{minWidth:58,textAlign:"center"}}>
+                                <div style={{fontSize:8,color:isCur?"#4fc3f7":"#3a4a6a",marginBottom:2,fontWeight:isCur?700:400}}>{mk}{isCur?" ★":""}</div>
+                                <div style={{background:bg,color:tx,borderRadius:4,padding:"3px 2px",fontSize:9,fontWeight:amt>0?600:400,border:isGap?"2px solid #B8860B":"1px solid #1e2a3a",minHeight:22,display:"flex",alignItems:"center",justifyContent:"center"}}>
+                                  {amt>0?fmtS(amt):"—"}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {gapMs.length>0&&(
+                          <div style={{marginBottom:5}}>
+                            <div style={{fontSize:10,color:"#FFD700",fontWeight:700,marginBottom:3}}>⚠ Missing months:</div>
+                            {gapMs.map(([gi,f])=>(
+                              <div key={gi} style={{display:"flex",gap:7,alignItems:"flex-start",marginBottom:2,padding:"3px 8px",background:"#FFD70018",borderLeft:"3px solid #FFD700",borderRadius:3}}>
+                                <span style={{fontWeight:700,color:"#FFD700",minWidth:46,fontSize:10,flexShrink:0}}>{r.monthKeys[gi]}</span>
+                                <span style={{fontSize:10,color:"#aabbcc",lineHeight:1.5}}>{f.note}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {covMs.length>0&&(
+                          <div style={{marginBottom:4}}>
+                            <div style={{fontSize:10,color:"#8bc34a",fontWeight:700,marginBottom:3}}>✓ Covered months:</div>
+                            {covMs.map(([gi,f])=>(
+                              <div key={gi} style={{display:"flex",gap:7,alignItems:"flex-start",marginBottom:2,padding:"3px 8px",background:"#8bc34a18",borderLeft:"3px solid #8bc34a",borderRadius:3}}>
+                                <span style={{fontWeight:700,color:"#8bc34a",minWidth:46,fontSize:10,flexShrink:0}}>{r.monthKeys[gi]}</span>
+                                <span style={{fontSize:10,color:"#aabbcc",lineHeight:1.5}}>{f.note}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {!r.hasFlag&&!r.skipReason&&<div style={{color:"#4CAF5066",fontSize:10}}>✓ All months accounted for.</div>}
+                        {r.skipReason&&<div style={{color:"#44444499",fontSize:10}}>⊘ {r.skipReason}</div>}
+                        {r.typ>0&&(
+                          <div style={{marginTop:5,fontSize:9,color:"#3a4a5a"}}>
+                            Base rate: <b style={{color:"#4466aa"}}>{fmt(r.typ)}</b>/month
+                            {r.isIndep?" · own runrate (independent PO)":r.isMain?" · ★ main PO":""}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            }
+            <div style={{marginTop:10,color:"#2a3a4a",fontSize:10,textAlign:"right"}}>
+              {fileName} · {parsed?.records?.length} POs · {sum.flagged} flagged · {sum.clean} clean
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
